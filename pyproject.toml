@@ -1,0 +1,21 @@
+[project]
+name = "forgelm"
+version = "0.1.0"
+description = "A decoder-only LLM built from scratch in PyTorch: BPE tokenizer, LLaMA-style transformer, training, generation."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["forgelm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
