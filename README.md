@@ -1,118 +1,74 @@
-# NanoLLM 🔬
+# ForgeLM
 
-Decoder-only transformer built from scratch — matching the LLaMA-3 architecture with modern components.
+A decoder-only language model **built from scratch in PyTorch**: tokenizer, transformer, training loop and generation. No `transformers`, no `tokenizers`, no wrappers. Only `torch`.
 
-Not a wrapper. Not a tutorial. A complete, trainable implementation demonstrating deep understanding of LLM internals.
+It is also my long-term base for machine-learning and LLM experiments, so it is kept small, tested and readable.
+
+## What is in it
+
+| Piece | Where | Notes |
+|---|---|---|
+| Byte-level **BPE tokenizer**, trained from scratch | `forgelm/tokenizer.py` | lossless round-trip for any text, special tokens, save/load |
+| **Transformer** (LLaMA-style) | `forgelm/model.py` | RMSNorm pre-norm, grouped-query attention, rotary embeddings (RoPE), SwiGLU MLP, tied embeddings |
+| **KV cache** generation | `forgelm/model.py` | stateless model, cache passed in; temperature, top-k, top-p |
+| **Training loop** | `forgelm/train.py` | AdamW with decay groups, warmup + cosine LR, grad clipping, best-checkpoint saving, bf16 on CUDA |
+| Data pipeline | `forgelm/data.py` | download, tokenize, random-window batches |
+| **Tests** | `tests/` | causality, cache equivalence, RoPE, tokenizer, overfit check |
+
+## Quickstart
+
+```bash
+git clone https://github.com/omkarbhad/forgelm && cd forgelm
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+pytest                                            # 23 tests
+python -m forgelm.data                            # download tiny Shakespeare, train the tokenizer
+python -m forgelm.train --preset tiny --max-steps 2000 --lr 2e-3
+python -m forgelm.generate --run runs/tiny --prompt "ROMEO:"
+```
+
+Device is picked automatically (CUDA, then Apple MPS, then CPU). Bring your own corpus with `python -m forgelm.data --text my.txt`.
+
+## Result
+
+Training results are not published yet. A tiny 3M-parameter run on tiny Shakespeare takes about 13 minutes on an Apple-silicon Mac (see Quickstart); numbers and samples will be added here once a full run is done.
 
 ## Architecture
 
 ```
-Input Tokens
-    ↓
-BPE Tokenizer (custom-trained)
-    ↓
-Token Embeddings (NO positional embeddings — RoPE is applied in attention)
-    ↓
-┌────────────────────────────────┐
-│  Transformer Block (×N)        │
-│  ├── RMSNorm (pre-norm)       │
-│  ├── Grouped Query Attention   │  ← GQA + RoPE + KV Cache
-│  │   └── FlashAttention-2     │
-│  ├── RMSNorm (pre-norm)       │
-│  └── SwiGLU FFN               │  ← SwiGLU replaces ReLU/GELU
-└────────────────────────────────┘
-    ↓
-RMSNorm
-    ↓
-Output Logits → Vocabulary
+tokens -> embedding
+       -> N x [ RMSNorm -> grouped-query attention (+RoPE, KV cache) -> residual
+                RMSNorm -> SwiGLU                                      -> residual ]
+       -> RMSNorm -> linear head (weights tied to the embedding) -> logits
 ```
 
-## What Makes This Different from nanoGPT
+Presets live in `forgelm/config.py` (`tiny`, `small`, `base`). Grouped-query attention shares each key/value head across several query heads, which shrinks the KV cache by `n_heads / n_kv_heads`.
 
-| Component | nanoGPT (2023) | NanoLLM (2025) |
-|-----------|---------------|----------------|
-| Attention | Standard MHA | **Grouped Query Attention (GQA)** |
-| Position | Learned embeddings | **Rotary Position Embeddings (RoPE)** |
-| Normalization | LayerNorm | **RMSNorm** (faster, no mean computation) |
-| Activation | GELU | **SwiGLU** (gated linear unit) |
-| Memory | Standard attention | **FlashAttention-2** (IO-aware) |
-| Inference | Naive autoregressive | **KV Cache** (no recomputation) |
-| Training | Single GPU | **DDP** (distributed data parallel) |
-| Precision | fp32 | **bf16 mixed precision** (AMP) |
+## Testing what matters
 
-## Project Structure
+Language-model bugs rarely crash; they quietly make the model cheat or generate garbage. The tests target exactly those:
 
-```
-NanoLLM/
-├── README.md
-├── model/
-│   ├── __init__.py
-│   ├── config.py           # Model configuration (NanoLLMConfig)
-│   ├── attention.py         # GQA + RoPE + FlashAttention-2 + KV Cache
-│   ├── feedforward.py       # SwiGLU FFN
-│   ├── normalization.py     # RMSNorm
-│   ├── transformer.py       # Full transformer block + model
-│   └── tokenizer.py         # BPE tokenizer (train + encode + decode)
-├── data/
-│   ├── prepare.py           # Download + preprocess corpus
-│   └── dataloader.py        # Streaming dataloader with packing
-├── train/
-│   ├── trainer.py           # Training loop (DDP + AMP + gradient accumulation)
-│   ├── train.py             # Main training script
-│   └── generate.py          # Text generation with KV cache
-├── notebooks/
-│   ├── 01_attention_deep_dive.ipynb
-│   ├── 02_training_curves.ipynb
-│   └── 03_generation_demo.ipynb
-└── requirements.txt
-```
+- **No future leakage**: changing token `t` must not change any logit before `t` (a missing causal mask makes a model look great in training and useless at inference).
+- **KV cache equals full forward**: prefill plus one-token steps, and chunks after a cached prefix, reproduce a single full pass. Catches wrong RoPE positions and wrong masks during cached decoding.
+- **RoPE is relative**: the score between positions `m` and `n` depends only on `m - n`.
+- **Greedy cached generation equals a naive loop.**
+- **The model can overfit one sequence**, which proves the whole stack is wired correctly.
 
-## Key Implementations
+I checked that these tests fail when the bugs are reintroduced.
 
-### Grouped Query Attention (GQA)
-```python
-# Standard MHA: n_heads query, n_heads key, n_heads value
-# GQA: n_heads query, n_kv_heads key, n_kv_heads value (n_kv_heads < n_heads)
-# LLaMA-3 8B: 32 query heads, 8 KV heads → 4x less KV memory
-```
+## Roadmap
 
-### Rotary Position Embeddings (RoPE)
-```python
-# Apply rotation to query and key vectors based on position
-# Allows relative position awareness without learned embeddings
-# Extrapolates to longer sequences than training length
-```
+- [ ] Larger corpus and a proper data loader (streaming, document packing)
+- [ ] Multi-GPU training (DDP), gradient accumulation
+- [ ] Evaluation harness (perplexity on held-out sets, small benchmarks)
+- [ ] Instruction fine-tuning and sampling improvements (repetition penalty, beam search)
+- [ ] Faster inference (preallocated KV cache, quantization)
+- [ ] Ablations: GQA vs MHA, RoPE vs learned positions, SwiGLU vs GELU
 
-### SwiGLU Activation
-```python
-# FFN(x) = SiLU(xW_gate) ⊙ (xW_up)  then  → W_down
-# 3 weight matrices instead of 2 — but empirically better
-# Hidden dim adjusted: 8/3 * d_model (rounded to multiple of 256)
-```
+## History
 
-## Quick Start
-
-```bash
-# Train BPE tokenizer
-python model/tokenizer.py --corpus data/corpus.txt --vocab_size 32000
-
-# Train model (single GPU)
-python train/train.py --config small  # 125M params
-
-# Train model (multi-GPU DDP)
-torchrun --nproc_per_node=4 train/train.py --config base  # 350M params
-
-# Generate text
-python train/generate.py --checkpoint outputs/model.pt --prompt "The transformer architecture"
-```
-
-## Model Configs
-
-| Config | Params | Layers | d_model | Heads | KV Heads | FFN dim |
-|--------|--------|--------|---------|-------|----------|---------|
-| tiny   | 15M    | 6      | 384     | 6     | 2        | 1024    |
-| small  | 125M   | 12     | 768     | 12    | 4        | 2048    |
-| base   | 350M   | 24     | 1024    | 16    | 4        | 2730    |
+This started as a notebook-based encoder-decoder transformer and an earlier `nanollm` prototype. Both had the same silent flaw: the decoder was not causally masked, so training leaked the answer and inference produced empty or wrong output. ForgeLM is the clean rewrite with tests that prevent that class of bug.
 
 ## License
 
